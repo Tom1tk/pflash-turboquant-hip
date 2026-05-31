@@ -2547,6 +2547,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (!split && is_tq_weight && src1->ne[1] == 1) {
         // Fused TQ weight mul_mat_vec with pre-rotated activations via warp shuffle WHT
         ggml_cuda_mul_mat_vec_tq(ctx, src0, src1, dst);
+    } else if (!split && is_tq_weight) {
+        // Batched TQ prefill — token loop, no cublas workspace
+        ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
     } else {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }

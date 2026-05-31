@@ -308,6 +308,90 @@ void ggml_cuda_mul_mat_vec_tq(ggml_backend_cuda_context & ctx,
 }
 
 // ============================================================================
+// Batched prefill: multiple tokens against one TQ weight matrix.
+//
+// Eliminates the cublas fallback for src1->ne[1] > 1 (prefill mode).
+// Loops over each token and launches the existing single-token V12/V8 kernel
+// with pointer offsets — no external workspace allocation needed.
+// ============================================================================
+
+void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
+                           const ggml_tensor * src0,
+                           const ggml_tensor * src1,
+                           ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int ncols_x  = src0->ne[0];
+    const int nrows_x  = src0->ne[1];
+    const int n_tokens = src1->ne[1];
+    const int n_b2     = src1->ne[2];
+    const int n_b3     = src1->ne[3];
+    GGML_ASSERT(ncols_x % 32 == 0);
+
+    const void * src0_d = src0->data;
+    cudaStream_t stream = ctx.stream();
+
+    const size_t shmem_needed = (size_t)ncols_x * sizeof(float);
+    const bool use_v12 = (shmem_needed <= 48 * 1024);
+
+    const dim3 block(WARP_SIZE, MMVQ_TQ_NWARPS);
+    const dim3 grid((nrows_x + MMVQ_TQ_NWARPS - 1) / MMVQ_TQ_NWARPS);
+
+    // V8 scratch (only for ncols_x > 12288, not expected in practice)
+    static float * d_v8_buf = nullptr;
+    static size_t  d_v8_buf_size = 0;
+
+    if (!use_v12) {
+        cudaStreamCaptureStatus cap_status;
+        cudaStreamIsCapturing(stream, &cap_status);
+        if (cap_status != cudaStreamCaptureStatusNone) {
+            GGML_ASSERT(d_v8_buf && d_v8_buf_size >= shmem_needed &&
+                "TQ batched V8 scratch not pre-allocated before graph capture");
+        } else if (shmem_needed > d_v8_buf_size) {
+            if (d_v8_buf) cudaFree(d_v8_buf);
+            cudaMalloc(&d_v8_buf, shmem_needed);
+            d_v8_buf_size = shmem_needed;
+        }
+    }
+
+    const dim3 rot_block(32, 4);
+    const dim3 rot_grid((ncols_x / 32 + 3) / 4);
+
+    for (int b3 = 0; b3 < n_b3; b3++) {
+        for (int b2 = 0; b2 < n_b2; b2++) {
+            for (int tok = 0; tok < n_tokens; tok++) {
+                const float * src1_tok = (const float *)((const char *)src1->data
+                    + b3 * src1->nb[3] + b2 * src1->nb[2] + tok * src1->nb[1]);
+                float * dst_tok = (float *)((char *)dst->data
+                    + b3 * dst->nb[3] + b2 * dst->nb[2] + tok * dst->nb[1]);
+
+                if (use_v12) {
+                    if (src0->type == GGML_TYPE_TQ4_1S) {
+                        mul_mat_vec_tq4_1s_v12<<<grid, block, shmem_needed, stream>>>(
+                            src0_d, src1_tok, dst_tok, ncols_x, nrows_x);
+                    } else {
+                        mul_mat_vec_tq3_1s_v12<<<grid, block, shmem_needed, stream>>>(
+                            src0_d, src1_tok, dst_tok, ncols_x, nrows_x);
+                    }
+                } else {
+                    tq_prerotate_activation_v8<<<rot_grid, rot_block, 0, stream>>>(
+                        src1_tok, d_v8_buf, ncols_x);
+                    if (src0->type == GGML_TYPE_TQ4_1S) {
+                        mul_mat_vec_tq4_1s_v8<<<grid, block, 0, stream>>>(
+                            src0_d, d_v8_buf, dst_tok, ncols_x, nrows_x);
+                    } else {
+                        mul_mat_vec_tq3_1s_v8<<<grid, block, 0, stream>>>(
+                            src0_d, d_v8_buf, dst_tok, ncols_x, nrows_x);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Load-time conversion: TQ4_1S → q8_0
 //
 // Fused kernel: dequant TQ4_1S (centroid lookup + inverse WHT) → quantize q8_0.
