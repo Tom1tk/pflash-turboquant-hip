@@ -864,6 +864,13 @@ private:
             cparams_mtp.n_ctx     = llama_n_ctx_seq(ctx);
             cparams_mtp.n_seq_max = 1;
             cparams_mtp.n_rs_seq = 0;
+            // Limit ctx_mtp's internal ubatch so that CUDA/HIP graph re-captures during prefill
+            // operate on small (256-token) sub-graphs instead of the full (n_ubatch-1)-token batch.
+            // Without this, each KV shape change triggers a full re-capture of a ~2047-token graph;
+            // the capture workspace + new instance simultaneously in VRAM causes OOM at ~24k tokens
+            // on 24 GB cards when serving long prompts (e.g. 35k context-compression requests).
+            // handle_mtp_for_ubatch passes up to (main_ubatch-1) tokens; ctx_mtp chunks them here.
+            cparams_mtp.n_ubatch = std::min(cparams_mtp.n_ubatch, (uint32_t) 256);
 
             params_base.speculative.mtp.model   = model_mtp.get();
             params_base.speculative.mtp.cparams = cparams_mtp;
