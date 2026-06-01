@@ -1,20 +1,138 @@
-# PFlash — Speculative Prefill for llama.cpp
+# mtp-pflash-turboquant-hip
 
-PFlash compresses long prompts using a small draft model before the target model prefill. See [PFLASH_PHASES.md](PFLASH_PHASES.md) for full development history, test results, and remaining work.
+Personal ROCm fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) optimised for Qwen3.6-27B on AMD RX 7900 XTX (gfx1100, ROCm 7.2.2). Combines [domvox/llama.cpp-turboquant-hip](https://github.com/domvox/llama.cpp-turboquant-hip) TurboQuant KV kernels with an updated llama.cpp core that supports the Qwen3.6 hybrid GDN+attention architecture, plus MTP speculative decoding, ROCm-specific fixes, and the PFlash block-sparse attention prefill compressor (experimental).
 
-**Quick start:**
-```sh
-# Auto mode — sweep-tuned policy
-llama-server --model model.gguf --model-draft draft.gguf --pflash-mode auto --pflash-window 4096
+---
 
-# NIAH benchmark with BSA
-llama-niah --model model.gguf --draft draft.gguf --pflash-keep-ratio 0.65 --pflash-bsa-auto 50000 --pflash-bsa
+## Changes vs mainline llama.cpp
+
+| change | detail |
+|--------|--------|
+| **TurboQuant KV cache** | WHT-based KV compression: `turbo2`, `turbo3`, `turbo4`, `turbo3_tcq`, `turbo2_tcq`. `turbo3` gives ~12 bytes/token vs ~64 bytes for f16 — 5× reduction. Required for 100k+ context within 24 GB VRAM. |
+| **Batched TQ prefill kernel** | New `ggml_cuda_mul_mat_tq` in `mmvq-tq.cu` handles prefill batches (batch > 1) for TurboQuant weight types. Without this, MTP + any ubatch > 128 caused rocBLAS OOM. Unlocks `ub=2048`, giving +30% prefill throughput. |
+| **Q6_K MMQ fix (RDNA3)** | `ggml_cuda_should_use_mmq` fell back to cublas for Q6_K on gfx1100 when `ne11 > 128`. Under MTP load the rocBLAS workspace for `output.weight`/`ffn_down` at large batch exceeded available VRAM. Fix: always use MMQ for Q6_K on RDNA3. |
+| **PFlash BSA** | Block-sparse attention prefill compressor. Experimental — see PFlash section below. |
+
+## Changes vs domvox/llama.cpp-turboquant-hip
+
+| change | detail |
+|--------|--------|
+| **Qwen3.6-27B support** | domvox's llama.cpp base predates the Qwen3.6 hybrid GDN (Gated Delta Net / SSM) architecture. domvox binaries crash at model load on Qwen3.6 GGUF files. |
+| **MTP speculative decoding** | Uses the model's own built-in nextn head — no separate draft file, no extra VRAM for draft model weights. Flag: `--spec-type mtp`. |
+| **Batched TQ kernel + Q6_K fix** | Both ROCm fixes above are absent from domvox. |
+
+---
+
+## Benchmark: RX 7900 XTX — Qwen3.6-27B UD Q4_K_XL
+
+**Hardware:** AMD RX 7900 XTX (gfx1100, 24 GB VRAM), Intel Xeon E5-2680 v4, ROCm 7.2.2  
+**Config:** `-fa 1 -ngl 99 -np 1 -c 100000 -ctk turbo3 -ctv turbo3 -ub 2048`
+
+### Metric definitions
+
+**Base tg** is the raw single-token decode rate measured by `llama-bench` — one token out per forward pass, no speculative decoding. This is the hardware floor.
+
+**Effective tg** is real output throughput with MTP enabled. MTP drafts N additional tokens per step using the model's nextn head and verifies them in the next base forward pass. Accepted drafts give you up to N+1 output tokens per step. Effective tg = total accepted tokens ÷ total wall time, measured via the server API over real requests. It is always higher than base tg when acceptance rate is good, and falls toward base tg as acceptance drops.
+
+At production temperature (0.6, `n_max=2`), effective tg is 43.52 tok/s (1.54× over base). At zero temperature (near-deterministic output, `n_max=2`) effective tg reaches 51.4 tok/s and was measured at 57.5 tok/s on a fresh short-context run (logged at localmaxxing.com — [run cmp3zweyy003upc01aiws6030](https://www.localmaxxing.com/runs/cmp3zweyy003upc01aiws6030)). The gap between those numbers reflects acceptance rate sensitivity to temperature and prompt context length: colder output and shorter context give the nextn head an easier prediction task.
+
+### Results
+
+| metric | domvox | mainline llama.cpp | **this fork** |
+|--------|--------|--------------------|---------------|
+| Model loads | ❌ crash at load | ✅ | ✅ |
+| TurboQuant KV | ✅ | ❌ | ✅ |
+| MTP | ❌ | ✅ | ✅ |
+| pp@2048 | — | ~717 tok/s † | **920 tok/s** |
+| base tg128 | — | ~28 tok/s | **28.3 tok/s** |
+| eff tg (MTP n=2, temp=0.6) | — | ~29 tok/s ‡ | **43.52 tok/s** |
+| eff tg (MTP n=2, temp=0.0) | — | — | **51.4 tok/s** |
+| eff tg (MTP n=2, short ctx) | — | — | **57.5 tok/s** |
+| max context (with MTP) | — | ~100k (q4_0 KV) | **147k (turbo3 KV)** |
+| VRAM free @100k | — | ~4 GiB | ~3.95 GiB |
+
+† Mainline ROCm with Q4_K_XL hits a Q6_K → cublas OOM at `ub > 128` under MTP load on gfx1100. The `~717` figure is at `ub=128`; with the MMQ fix this fork gets 920 at `ub=2048`.  
+‡ Mainline ROCm MTP has a TOP_K CPU fallback for Qwen3.6's 151,936-token vocabulary, giving a ~1.04× MTP multiplier. Effective tg barely exceeds base tg.
+
+Full parameter sweep, VRAM tables, KV type comparison, and tool-call gate results: [RESULTS.md](RESULTS.md).
+
+---
+
+## Recommended serve command — RX 7900 XTX
+
+```bash
+# Standard (turbo3 KV, 100k context, MTP n=2)
+./build/bin/llama-server \
+  -m ~/Qwen3.6-27B-UD-Q4_K_XL.gguf \
+  -ngl 99 -np 1 -fa 1 -ctk turbo3 -ctv turbo3 \
+  -b 4096 -ub 2048 -c 100000 --no-context-shift \
+  --spec-type mtp --spec-draft-n-max 2 --spec-draft-p-min 0.90 \
+  --reasoning off --jinja --no-warmup \
+  --host 0.0.0.0 --port 8080
 ```
 
-**Key findings:**
-- GPU drafter: 4–5× faster than CPU; 43% TTFT speedup at 128k
-- Quality floor for semantic code tasks: kr=0.55 windowed (100% pass)
-- BSA single-pass ≤50k tokens; windowed mode above for best speed/quality
+Expected: pp@2048 ~920 tok/s | eff tg ~43.5 tok/s (temp=0.6) | VRAM free ~3.95 GiB
+
+```bash
+# Extended context (turbo3 KV, 147k — empirically verified maximum with MTP)
+./build/bin/llama-server \
+  -m ~/Qwen3.6-27B-UD-Q4_K_XL.gguf \
+  -ngl 99 -np 1 -fa 1 -ctk turbo3 -ctv turbo3 \
+  -b 4096 -ub 2048 -c 147456 --no-context-shift \
+  --spec-type mtp --spec-draft-n-max 2 --spec-draft-p-min 0.90 \
+  --reasoning off --jinja --no-warmup \
+  --host 0.0.0.0 --port 8080
+```
+
+Decode speed is unchanged at 147k vs 100k — Qwen3.6's 49 GDN (SSM) layers are O(1) in context. Only the 16 full attention layers read the KV cache, so extending context is free from a throughput perspective.
+
+---
+
+## PFlash — Block-Sparse Attention Prefill Compression
+
+PFlash is an experimental long-context prefill accelerator built into this fork. It uses a small draft model (Qwen3.5-0.6B or 0.8B) to score KV blocks by relevance before the main model prefill, then compresses the prompt to a `keep_ratio` fraction of its original length using block-sparse attention. The goal is to reduce time-to-first-token (TTFT) on large contexts.
+
+### How it works
+
+1. The draft model scores each 128-token KV block by centrality (cosine similarity to recent context) or observation-window attention (dot-product proxy query vs historical K vectors).
+2. Top-scoring blocks are kept; the rest are masked out via a sparse attention mask (`GGML_OP_PFLASH_BSA_ATTN`).
+3. The main model prefills with only the retained blocks, reducing the effective context fed through attention.
+4. Sink tokens (first 2048) and recent tokens (last 4096) are always kept — compression only applies to middle blocks.
+
+### Modes
+
+| flag | behaviour |
+|------|-----------|
+| `--pflash-mode off` | Disabled (default) |
+| `--pflash-mode on` | Always compress |
+| `--pflash-mode auto` | Compress if context > `--pflash-bsa-auto` tokens (default 50k) |
+| `--pflash-keep-ratio 0.65` | Fraction of blocks to retain (recommended: 0.65) |
+| `--pflash-window 4096` | Windowed chunked mode (alternative to BSA single-pass) |
+| `--pflash-bsa` | BSA single-pass mode |
+| `--pflash-coverage-zones 4` | Divide middle blocks into N zones, force proportional retention (reduces mid-context drop) |
+| `--pflash-min-blocks-per-file 1` | Keep ≥1 block per `// ===== FILE:` marker (helps multi-file code tasks) |
+
+### What was tested
+
+Eleven phases of development covering:
+- GPU scoring kernels (HIP, 1.4ms at 100k vs 82ms CPU)
+- NIAH quality sweeps (10 trials × 7 keep ratios × 2 modes at 32k and 128k)
+- Semantic code comprehension (22 questions across 5 types, 396 total configs, 3 needle positions)
+- BSA vs windowed mode cross-comparison
+- Coverage zones and file-aware retention algorithms
+- MTP + PFlash combined testing
+
+### Findings and caveats
+
+**Quality:** At `kr=0.65`, windowed mode passes 95% of semantic code questions at early and late needle positions. Mid-position accuracy drops to 77% (windowed) or 68% (BSA) — blocks that are neither at the start nor end of context are at risk of being dropped, and no scoring heuristic fully compensates. Minimum viable keep ratio for code tasks is `kr≥0.55`; anything below starts losing definition lookups.
+
+**TTFT vs overhead:** PFlash reduces attention compute for the main model, but the draft model must first score all blocks. At 100k tokens, draft scoring takes ~6s (GPU) and adds to the wall-clock TTFT. The net TTFT saving only materialises when the prompt is large enough that the main model's full attention cost exceeds the draft model's scoring cost. In practice this threshold is context-dependent and hard to predict; the TTFT improvement was measured as marginal or within noise for the tested workloads.
+
+**MTP conflict:** PFlash and MTP cannot be usefully combined at large context on 24 GB VRAM. The draft model (PFlash) and MTP context both compete for compute buffer VRAM. At prompts above ~4096 tokens, running both causes OOM during MTP's per-step hook. On short prompts PFlash is bypassed anyway (below its threshold), so the combination gives MTP decode but no prefill benefit. **If you are using MTP, disable PFlash** (`--pflash-mode off`, which is the default).
+
+**BSA mode vs windowed mode:** At `kr≥0.65` both modes give equivalent quality. Below `kr=0.60`, BSA preserves cross-file references better than windowed but scores worse on mid-position single-file lookups. Coverage zones (`--pflash-coverage-zones 4`) rescue some mid-position failures by forcing proportional block retention across context zones.
+
+**Current status:** PFlash development is paused at Phase 11. The fundamental limitation — mid-position context is fragile under any scoring heuristic that operates per-block rather than per-file — was not resolved. The feature works correctly and passes NIAH/code tests at safe keep ratios, but provides no reliable TTFT improvement over the tested workloads when accounting for draft model overhead. It remains in the fork for anyone who wants to experiment with long-context compression independently of MTP.
 
 ---
 
