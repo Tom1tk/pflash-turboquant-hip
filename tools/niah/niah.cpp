@@ -15,7 +15,9 @@
 #include <set>
 #include <fstream>
 #include <iostream>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 using json = nlohmann::json;
 
