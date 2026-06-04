@@ -1,0 +1,203 @@
+name: Release (Windows CUDA)
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub release'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  CMAKE_ARGS: >-
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_TOOLS=ON
+    -DLLAMA_BUILD_SERVER=ON
+    -DGGML_RPC=ON
+
+jobs:
+  windows-cpu:
+    runs-on: windows-2025
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            %CMAKE_ARGS%
+          cmake --build build --config Release
+
+      - name: Pack artifacts
+        run: |
+          Copy-Item LICENSE .\build\bin\Release\
+          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cpu-x64.zip
+          name: llama-bin-win-cpu-x64.zip
+
+  windows-cuda:
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.1'
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        # sm_89 = Ada Lovelace (RTX 40xx), sm_120 = Blackwell consumer (RTX 50xx)
+        # GGML_CUDA_CUB_3DOT2: workaround until CCCL 3.2 is bundled in CTK
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="89;120" ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: Pack CUDA backend
+        run: 7z a -snl llama-bin-win-cuda-13.1-x64.zip .\build\bin\Release\ggml-cuda.dll
+
+      - name: Pack CUDA runtime DLLs
+        run: |
+          $dst = '.\build\bin\cudart\'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          foreach ($src in @("$env:CUDA_PATH\bin", "$env:CUDA_PATH\lib", "$env:CUDA_PATH\bin\x64")) {
+            if (Test-Path $src) {
+              robocopy $src $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll | Out-Null
+            }
+          }
+          7z a cudart-llama-bin-win-cuda-13.1-x64.zip $dst\*
+
+      - name: Upload CUDA backend
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda-13.1-x64.zip
+          name: llama-bin-win-cuda-13.1-x64.zip
+
+      - name: Upload CUDA runtime
+        uses: actions/upload-artifact@v6
+        with:
+          path: cudart-llama-bin-win-cuda-13.1-x64.zip
+          name: cudart-llama-bin-win-cuda-13.1-x64.zip
+
+  release:
+    if: ${{ github.event.inputs.create_release == 'true' }}
+    needs: [windows-cpu, windows-cuda]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifact
+          merge-multiple: true
+
+      - name: Assemble release zips
+        run: |
+          mkdir -p release cpu_tmp
+
+          # Extract CPU binaries
+          unzip artifact/llama-bin-win-cpu-x64.zip -d cpu_tmp
+
+          # Combined zip: CPU tools + ggml-cuda.dll (the CUDA backend DLL)
+          cp artifact/llama-bin-win-cuda-13.1-x64.zip release/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip
+          (cd cpu_tmp && zip -r ../release/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip .)
+
+          # CPU-only zip
+          cp artifact/llama-bin-win-cpu-x64.zip release/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip
+
+          # CUDA runtime DLLs (separate download)
+          cp artifact/cudart-llama-bin-win-cuda-13.1-x64.zip release/cudart-llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip
+
+      - name: Create release
+        id: create_release
+        uses: ggml-org/action-create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          body: |
+            ## mtp-pflash-turboquant — Windows CUDA Build
+
+            Built from branch `${{ env.BRANCH_NAME }}` with CUDA 13.1, targeting **sm_89** (RTX 40xx) and **sm_120** (RTX 50xx / Blackwell).
+
+            ### Download
+
+            **RTX 5070 / Blackwell (sm_120):**
+            1. Download and extract **`llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip`** — contains all tools + `ggml-cuda.dll`
+            2. Download and extract **`cudart-llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip`** into the same folder — CUDA runtime DLLs
+
+            **CPU-only (no GPU required):**
+            - `llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip`
+
+            ### Features
+            - MTP (Multi-Token Prediction) speculative decoding
+            - PFlash speculative prefill
+            - TurboQuant KV cache compression
+
+      - name: Upload release assets
+        uses: actions/github-script@v8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const releaseId = '${{ steps.create_release.outputs.id }}';
+            for (const file of fs.readdirSync('./release')) {
+              if (file.endsWith('.zip') || file.endsWith('.tar.gz')) {
+                console.log('Uploading', file);
+                await github.rest.repos.uploadReleaseAsset({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: releaseId,
+                  name: file,
+                  data: fs.readFileSync(`./release/${file}`)
+                });
+              }
+            }
