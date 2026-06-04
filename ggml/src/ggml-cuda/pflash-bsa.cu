@@ -1,3 +1,4 @@
+#ifdef GGML_USE_HIP
 #include "common.cuh"
 #include <hip/hip_runtime.h>
 #include <math.h>
@@ -206,3 +207,4 @@ bool ggml_cuda_pflash_bsa_attn_supported(int device, const ggml_tensor * dst) {
            dst->src[2]->type == GGML_TYPE_F32 &&
            dst->src[3]->type == GGML_TYPE_I32;
 }
+#endif // GGML_USE_HIP

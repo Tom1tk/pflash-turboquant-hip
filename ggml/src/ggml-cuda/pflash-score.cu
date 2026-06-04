@@ -1,6 +1,6 @@
+#ifdef GGML_USE_HIP
 #include "ggml-cuda.h"
 #include "ggml-backend.h"
-
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <math.h>
@@ -304,3 +304,4 @@ int32_t pflash_score_gpu_obs_attn(
 
     return n_blocks;
 }
+#endif // GGML_USE_HIP

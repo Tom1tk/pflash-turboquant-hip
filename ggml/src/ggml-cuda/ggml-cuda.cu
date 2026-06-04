@@ -59,7 +59,9 @@
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
+#ifdef GGML_USE_HIP
 #include "ggml-cuda/pflash-bsa.cuh"
+#endif
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
@@ -3012,9 +3014,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
+#ifdef GGML_USE_HIP
         case GGML_OP_PFLASH_BSA_ATTN:
             ggml_cuda_pflash_bsa_attn(ctx, dst);
             break;
+#endif
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
@@ -5390,8 +5394,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #endif // GGML_USE_MUSA
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+#ifdef GGML_USE_HIP
         case GGML_OP_PFLASH_BSA_ATTN:
             return ggml_cuda_pflash_bsa_attn_supported(dev_ctx->device, op);
+#endif
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
