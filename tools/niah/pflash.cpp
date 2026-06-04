@@ -645,7 +645,7 @@ pflash_result pflash_compress(
     std::vector<float> scores(n_blocks);
     bool scored = false;
 
-#if defined(GGML_USE_CUDA) || defined(GGML_USE_HIP)
+#if defined(GGML_USE_HIP)
     if (!use_chunked) {
         struct ggml_tensor * k_tensor = llama_kv_cache_get_k_tensor(draft_ctx, score_layer);
         if (k_tensor && k_tensor->data) {
