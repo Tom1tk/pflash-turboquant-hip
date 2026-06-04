@@ -13,7 +13,11 @@
 #include <cmath>
 #include <vector>
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) int turbo3_cpu_wht_group_size;
+#else
 extern "C" int turbo3_cpu_wht_group_size;
+#endif
 
 // ggml_compute_forward_dup
 
