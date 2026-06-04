@@ -19,41 +19,6 @@ env:
     -DGGML_RPC=ON
 
 jobs:
-  windows-cpu:
-    runs-on: windows-2025
-
-    steps:
-      - name: Clone
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Install Ninja
-        run: choco install ninja
-
-      - name: Build
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          cmake -S . -B build -G "Ninja Multi-Config" ^
-            -DGGML_BACKEND_DL=ON ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_CPU_ALL_VARIANTS=ON ^
-            -DLLAMA_BUILD_BORINGSSL=ON ^
-            %CMAKE_ARGS%
-          cmake --build build --config Release
-
-      - name: Pack artifacts
-        run: |
-          Copy-Item LICENSE .\build\bin\Release\
-          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          path: llama-bin-win-cpu-x64.zip
-          name: llama-bin-win-cpu-x64.zip
-
   windows-cuda:
     runs-on: windows-2022
 
@@ -80,16 +45,19 @@ jobs:
           cmake -S . -B build -G "Ninja Multi-Config" ^
             -DGGML_BACKEND_DL=ON ^
             -DGGML_NATIVE=OFF ^
-            -DGGML_CPU=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="89;120" ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DGGML_CUDA_CUB_3DOT2=ON
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            %CMAKE_ARGS%
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+          cmake --build build --config Release -j %NINJA_JOBS%
 
-      - name: Pack CUDA backend
-        run: 7z a -snl llama-bin-win-cuda-13.1-x64.zip .\build\bin\Release\ggml-cuda.dll
+      - name: Pack artifacts
+        run: |
+          Copy-Item LICENSE .\build\bin\Release\
+          7z a -snl llama-bin-win-cuda-13.1-x64.zip .\build\bin\Release\*
 
       - name: Pack CUDA runtime DLLs
         run: |
@@ -102,21 +70,17 @@ jobs:
           }
           7z a cudart-llama-bin-win-cuda-13.1-x64.zip $dst\*
 
-      - name: Upload CUDA backend
+      - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-cuda-13.1-x64.zip
-          name: llama-bin-win-cuda-13.1-x64.zip
-
-      - name: Upload CUDA runtime
-        uses: actions/upload-artifact@v6
-        with:
-          path: cudart-llama-bin-win-cuda-13.1-x64.zip
-          name: cudart-llama-bin-win-cuda-13.1-x64.zip
+          path: |
+            llama-bin-win-cuda-13.1-x64.zip
+            cudart-llama-bin-win-cuda-13.1-x64.zip
+          name: llama-bin-win-cuda-13.1
 
   release:
     if: ${{ github.event.inputs.create_release == 'true' }}
-    needs: [windows-cpu, windows-cuda]
+    needs: [windows-cuda]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -139,20 +103,9 @@ jobs:
 
       - name: Assemble release zips
         run: |
-          mkdir -p release cpu_tmp
-
-          # Extract CPU binaries
-          unzip artifact/llama-bin-win-cpu-x64.zip -d cpu_tmp
-
-          # Combined zip: CPU tools + ggml-cuda.dll (the CUDA backend DLL)
-          cp artifact/llama-bin-win-cuda-13.1-x64.zip release/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip
-          (cd cpu_tmp && zip -r ../release/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip .)
-
-          # CPU-only zip
-          cp artifact/llama-bin-win-cpu-x64.zip release/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip
-
-          # CUDA runtime DLLs (separate download)
-          cp artifact/cudart-llama-bin-win-cuda-13.1-x64.zip release/cudart-llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip
+          mkdir -p release
+          mv artifact/llama-bin-win-cuda-13.1-x64.zip        release/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip
+          mv artifact/cudart-llama-bin-win-cuda-13.1-x64.zip release/cudart-llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip
 
       - name: Create release
         id: create_release
@@ -166,14 +119,12 @@ jobs:
 
             Built from branch `${{ env.BRANCH_NAME }}` with CUDA 13.1, targeting **sm_89** (RTX 40xx) and **sm_120** (RTX 50xx / Blackwell).
 
-            ### Download
+            ### Install
 
-            **RTX 5070 / Blackwell (sm_120):**
-            1. Download and extract **`llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip`** — contains all tools + `ggml-cuda.dll`
-            2. Download and extract **`cudart-llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip`** into the same folder — CUDA runtime DLLs
+            1. Extract **`llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip`** — all EXEs, DLLs, and `ggml-cuda.dll`
+            2. Extract **`cudart-llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip`** into the same folder — CUDA runtime DLLs
 
-            **CPU-only (no GPU required):**
-            - `llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip`
+            Then run `llama-server.exe` or `llama-cli.exe` directly — no build required.
 
             ### Features
             - MTP (Multi-Token Prediction) speculative decoding
@@ -187,7 +138,6 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const path = require('path');
             const releaseId = '${{ steps.create_release.outputs.id }}';
             for (const file of fs.readdirSync('./release')) {
               if (file.endsWith('.zip') || file.endsWith('.tar.gz')) {
