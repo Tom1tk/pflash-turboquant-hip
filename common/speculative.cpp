@@ -742,6 +742,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
             }
 
             const llama_token best = common_sampler_sample(smpl, ctx_mtp, 0);
+            const auto * cur_p = common_sampler_get_candidates(smpl, true);
+            if (cur_p->size > 0 && cur_p->data[0].p < params.draft.p_min) {
+                break;
+            }
             common_sampler_accept(smpl, best, /*accept_grammar=*/ false);
             draft_tokens.push_back(best);
             cond_tok = best;
